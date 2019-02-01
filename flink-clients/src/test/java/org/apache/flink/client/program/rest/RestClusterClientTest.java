@@ -21,7 +21,6 @@ package org.apache.flink.client.program.rest;
 import org.apache.flink.api.common.JobExecutionResult;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobSubmissionResult;
-import org.apache.flink.api.common.time.Time;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.client.cli.DefaultCLI;
 import org.apache.flink.client.deployment.StandaloneClusterDescriptor;
@@ -31,8 +30,8 @@ import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.JobManagerOptions;
 import org.apache.flink.configuration.RestOptions;
 import org.apache.flink.runtime.client.JobStatusMessage;
+import org.apache.flink.runtime.clusterframework.ApplicationStatus;
 import org.apache.flink.runtime.concurrent.FutureUtils;
-import org.apache.flink.runtime.dispatcher.Dispatcher;
 import org.apache.flink.runtime.dispatcher.DispatcherGateway;
 import org.apache.flink.runtime.jobgraph.JobGraph;
 import org.apache.flink.runtime.jobgraph.JobStatus;
@@ -40,6 +39,7 @@ import org.apache.flink.runtime.jobmaster.JobResult;
 import org.apache.flink.runtime.messages.Acknowledge;
 import org.apache.flink.runtime.messages.webmonitor.JobDetails;
 import org.apache.flink.runtime.messages.webmonitor.MultipleJobsDetails;
+import org.apache.flink.runtime.rest.HttpMethodWrapper;
 import org.apache.flink.runtime.rest.RestClient;
 import org.apache.flink.runtime.rest.RestClientConfiguration;
 import org.apache.flink.runtime.rest.RestServerEndpoint;
@@ -52,8 +52,6 @@ import org.apache.flink.runtime.rest.handler.async.AsynchronousOperationInfo;
 import org.apache.flink.runtime.rest.handler.async.AsynchronousOperationResult;
 import org.apache.flink.runtime.rest.handler.async.TriggerResponse;
 import org.apache.flink.runtime.rest.messages.AccumulatorsIncludeSerializedValueQueryParameter;
-import org.apache.flink.runtime.rest.messages.BlobServerPortHeaders;
-import org.apache.flink.runtime.rest.messages.BlobServerPortResponseBody;
 import org.apache.flink.runtime.rest.messages.EmptyMessageParameters;
 import org.apache.flink.runtime.rest.messages.EmptyRequestBody;
 import org.apache.flink.runtime.rest.messages.EmptyResponseBody;
@@ -89,8 +87,9 @@ import org.apache.flink.runtime.rest.messages.job.savepoints.SavepointTriggerReq
 import org.apache.flink.runtime.rest.util.RestClientException;
 import org.apache.flink.runtime.rpc.RpcUtils;
 import org.apache.flink.runtime.util.ExecutorThreadFactory;
+import org.apache.flink.runtime.webmonitor.TestingDispatcherGateway;
 import org.apache.flink.runtime.webmonitor.retriever.GatewayRetriever;
-import org.apache.flink.testutils.category.New;
+import org.apache.flink.util.ConfigurationException;
 import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.FlinkException;
 import org.apache.flink.util.OptionalFailure;
@@ -107,9 +106,6 @@ import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
-import org.junit.experimental.categories.Category;
-import org.mockito.Mock;
-import org.mockito.MockitoAnnotations;
 
 import javax.annotation.Nonnull;
 
@@ -125,6 +121,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -143,8 +140,6 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThat;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
-import static org.mockito.Matchers.any;
-import static org.mockito.Mockito.when;
 
 /**
  * Tests for the {@link RestClusterClient}.
@@ -152,20 +147,13 @@ import static org.mockito.Mockito.when;
  * <p>These tests verify that the client uses the appropriate headers for each
  * request, properly constructs the request bodies/parameters and processes the responses correctly.
  */
-@Category(New.class)
 public class RestClusterClientTest extends TestLogger {
 
-	private static final String REST_ADDRESS = "http://localhost:1234";
+	private final DispatcherGateway mockRestfulGateway = new TestingDispatcherGateway.Builder().build();
 
-	@Mock
-	private Dispatcher mockRestfulGateway;
-
-	@Mock
 	private GatewayRetriever<DispatcherGateway> mockGatewayRetriever;
 
 	private RestServerEndpointConfiguration restServerEndpointConfiguration;
-
-	private RestClusterClient<StandaloneClusterId> restClusterClient;
 
 	private volatile FailHttpRequestPredicate failHttpRequest = FailHttpRequestPredicate.never();
 
@@ -174,29 +162,58 @@ public class RestClusterClientTest extends TestLogger {
 	private JobGraph jobGraph;
 	private JobID jobId;
 
-	@Before
-	public void setUp() throws Exception {
-		MockitoAnnotations.initMocks(this);
-		when(mockRestfulGateway.requestRestAddress(any(Time.class))).thenReturn(CompletableFuture.completedFuture(REST_ADDRESS));
+	private static final Configuration restConfig;
 
+	static {
 		final Configuration config = new Configuration();
 		config.setString(JobManagerOptions.ADDRESS, "localhost");
 		config.setInteger(RestOptions.RETRY_MAX_ATTEMPTS, 10);
 		config.setLong(RestOptions.RETRY_DELAY, 0);
+		config.setInteger(RestOptions.PORT, 0);
 
-		restServerEndpointConfiguration = RestServerEndpointConfiguration.fromConfiguration(config);
+		restConfig = config;
+	}
+
+	@Before
+	public void setUp() throws Exception {
+		restServerEndpointConfiguration = RestServerEndpointConfiguration.fromConfiguration(restConfig);
 		mockGatewayRetriever = () -> CompletableFuture.completedFuture(mockRestfulGateway);
 
 		executor = Executors.newSingleThreadExecutor(new ExecutorThreadFactory(RestClusterClientTest.class.getSimpleName()));
-		final RestClient restClient = new RestClient(RestClientConfiguration.fromConfiguration(config), executor) {
+
+		jobGraph = new JobGraph("testjob");
+		jobId = jobGraph.getJobID();
+	}
+
+	@After
+	public void tearDown() {
+		if (executor != null) {
+			executor.shutdown();
+		}
+	}
+
+	private RestClusterClient<StandaloneClusterId> createRestClusterClient(final int port) throws Exception {
+		final Configuration clientConfig = new Configuration(restConfig);
+		clientConfig.setInteger(RestOptions.PORT, port);
+		return new RestClusterClient<>(
+			clientConfig,
+			createRestClient(),
+			StandaloneClusterId.getInstance(),
+			(attempt) -> 0,
+			null);
+	}
+
+	@Nonnull
+	private RestClient createRestClient() throws ConfigurationException {
+		return new RestClient(RestClientConfiguration.fromConfiguration(restConfig), executor) {
 			@Override
 			public <M extends MessageHeaders<R, P, U>, U extends MessageParameters, R extends RequestBody, P extends ResponseBody> CompletableFuture<P>
 			sendRequest(
-					final String targetAddress,
-					final int targetPort,
-					final M messageHeaders,
-					final U messageParameters,
-					final R request) throws IOException {
+				final String targetAddress,
+				final int targetPort,
+				final M messageHeaders,
+				final U messageParameters,
+				final R request) throws IOException {
 				if (failHttpRequest.test(messageHeaders, messageParameters, request)) {
 					return FutureUtils.completedExceptionally(new IOException("expected"));
 				} else {
@@ -204,59 +221,41 @@ public class RestClusterClientTest extends TestLogger {
 				}
 			}
 		};
-		restClusterClient = new RestClusterClient<>(
-			config,
-			restClient,
-			StandaloneClusterId.getInstance(),
-			(attempt) -> 0,
-			null);
-
-		jobGraph = new JobGraph("testjob");
-		jobId = jobGraph.getJobID();
-	}
-
-	@After
-	public void tearDown() throws Exception {
-		if (restClusterClient != null) {
-			restClusterClient.shutdown();
-		}
-
-		if (executor != null) {
-			executor.shutdown();
-		}
 	}
 
 	@Test
 	public void testJobSubmitCancelStop() throws Exception {
-		TestBlobServerPortHandler portHandler = new TestBlobServerPortHandler();
 		TestJobSubmitHandler submitHandler = new TestJobSubmitHandler();
 		TestJobTerminationHandler terminationHandler = new TestJobTerminationHandler();
 		TestJobExecutionResultHandler testJobExecutionResultHandler =
 			new TestJobExecutionResultHandler(
 				JobExecutionResultResponseBody.created(new JobResult.Builder()
+					.applicationStatus(ApplicationStatus.SUCCEEDED)
 					.jobId(jobId)
 					.netRuntime(Long.MAX_VALUE)
 					.build()));
 
-		try (TestRestServerEndpoint ignored = createRestServerEndpoint(
-			portHandler,
+		try (TestRestServerEndpoint restServerEndpoint = createRestServerEndpoint(
 			submitHandler,
 			terminationHandler,
 			testJobExecutionResultHandler)) {
+			RestClusterClient<?> restClusterClient = createRestClusterClient(restServerEndpoint.getServerAddress().getPort());
 
-			Assert.assertFalse(portHandler.portRetrieved);
-			Assert.assertFalse(submitHandler.jobSubmitted);
-			restClusterClient.submitJob(jobGraph, ClassLoader.getSystemClassLoader());
-			Assert.assertTrue(portHandler.portRetrieved);
-			Assert.assertTrue(submitHandler.jobSubmitted);
+			try {
+				Assert.assertFalse(submitHandler.jobSubmitted);
+				restClusterClient.submitJob(jobGraph, ClassLoader.getSystemClassLoader());
+				Assert.assertTrue(submitHandler.jobSubmitted);
 
-			Assert.assertFalse(terminationHandler.jobCanceled);
-			restClusterClient.cancel(jobId);
-			Assert.assertTrue(terminationHandler.jobCanceled);
+				Assert.assertFalse(terminationHandler.jobCanceled);
+				restClusterClient.cancel(jobId);
+				Assert.assertTrue(terminationHandler.jobCanceled);
 
-			Assert.assertFalse(terminationHandler.jobStopped);
-			restClusterClient.stop(jobId);
-			Assert.assertTrue(terminationHandler.jobStopped);
+				Assert.assertFalse(terminationHandler.jobStopped);
+				restClusterClient.stop(jobId);
+				Assert.assertTrue(terminationHandler.jobStopped);
+			} finally {
+				restClusterClient.shutdown();
+			}
 		}
 	}
 
@@ -266,36 +265,25 @@ public class RestClusterClientTest extends TestLogger {
 	@Test
 	public void testDetachedJobSubmission() throws Exception {
 
-		final TestBlobServerPortHandler testBlobServerPortHandler = new TestBlobServerPortHandler();
 		final TestJobSubmitHandler testJobSubmitHandler = new TestJobSubmitHandler();
 
-		try (TestRestServerEndpoint ignored = createRestServerEndpoint(
-			testBlobServerPortHandler,
+		try (TestRestServerEndpoint restServerEndpoint = createRestServerEndpoint(
 			testJobSubmitHandler)) {
+			RestClusterClient<?> restClusterClient = createRestClusterClient(restServerEndpoint.getServerAddress().getPort());
 
-			restClusterClient.setDetached(true);
-			final JobSubmissionResult jobSubmissionResult = restClusterClient.submitJob(jobGraph, ClassLoader.getSystemClassLoader());
+			try {
+				restClusterClient.setDetached(true);
+				final JobSubmissionResult jobSubmissionResult = restClusterClient.submitJob(jobGraph, ClassLoader.getSystemClassLoader());
 
-			// if the detached mode didn't work, then we would not reach this point because the execution result
-			// retrieval would have failed.
-			assertThat(jobSubmissionResult, is(not(instanceOf(JobExecutionResult.class))));
-			assertThat(jobSubmissionResult.getJobID(), is(jobId));
+				// if the detached mode didn't work, then we would not reach this point because the execution result
+				// retrieval would have failed.
+				assertThat(jobSubmissionResult, is(not(instanceOf(JobExecutionResult.class))));
+				assertThat(jobSubmissionResult.getJobID(), is(jobId));
+			} finally {
+				restClusterClient.shutdown();
+			}
 		}
 
-	}
-
-	private class TestBlobServerPortHandler extends TestHandler<EmptyRequestBody, BlobServerPortResponseBody, EmptyMessageParameters> {
-		private volatile boolean portRetrieved = false;
-
-		private TestBlobServerPortHandler() {
-			super(BlobServerPortHeaders.getInstance());
-		}
-
-		@Override
-		protected CompletableFuture<BlobServerPortResponseBody> handleRequest(@Nonnull HandlerRequest<EmptyRequestBody, EmptyMessageParameters> request, @Nonnull DispatcherGateway gateway) throws RestHandlerException {
-			portRetrieved = true;
-			return CompletableFuture.completedFuture(new BlobServerPortResponseBody(12000));
-		}
 	}
 
 	private class TestJobSubmitHandler extends TestHandler<JobSubmitRequestBody, JobSubmitResponseBody, EmptyMessageParameters> {
@@ -372,14 +360,16 @@ public class RestClusterClientTest extends TestLogger {
 	public void testSubmitJobAndWaitForExecutionResult() throws Exception {
 		final TestJobExecutionResultHandler testJobExecutionResultHandler =
 			new TestJobExecutionResultHandler(
-				new RestHandlerException("should trigger retry", HttpResponseStatus.NOT_FOUND),
+				new RestHandlerException("should trigger retry", HttpResponseStatus.SERVICE_UNAVAILABLE),
 				JobExecutionResultResponseBody.inProgress(),
 				JobExecutionResultResponseBody.created(new JobResult.Builder()
+					.applicationStatus(ApplicationStatus.SUCCEEDED)
 					.jobId(jobId)
 					.netRuntime(Long.MAX_VALUE)
 					.accumulatorResults(Collections.singletonMap("testName", new SerializedValue<>(OptionalFailure.of(1.0))))
 					.build()),
 				JobExecutionResultResponseBody.created(new JobResult.Builder()
+					.applicationStatus(ApplicationStatus.FAILED)
 					.jobId(jobId)
 					.netRuntime(Long.MAX_VALUE)
 					.serializedThrowable(new SerializedThrowable(new RuntimeException("expected")))
@@ -390,28 +380,34 @@ public class RestClusterClientTest extends TestLogger {
 		failHttpRequest = (messageHeaders, messageParameters, requestBody) ->
 			messageHeaders instanceof JobExecutionResultHeaders && !firstPollFailed.getAndSet(true);
 
-		try (TestRestServerEndpoint ignored = createRestServerEndpoint(
+		try (TestRestServerEndpoint restServerEndpoint = createRestServerEndpoint(
 			testJobExecutionResultHandler,
-			new TestBlobServerPortHandler(),
 			new TestJobSubmitHandler())) {
-
-			JobExecutionResult jobExecutionResult;
-
-			jobExecutionResult = (JobExecutionResult) restClusterClient.submitJob(
-				jobGraph,
-				ClassLoader.getSystemClassLoader());
-			assertThat(jobExecutionResult.getJobID(), equalTo(jobId));
-			assertThat(jobExecutionResult.getNetRuntime(), equalTo(Long.MAX_VALUE));
-			assertThat(
-				jobExecutionResult.getAllAccumulatorResults(),
-				equalTo(Collections.singletonMap("testName", 1.0)));
+			RestClusterClient<?> restClusterClient = createRestClusterClient(restServerEndpoint.getServerAddress().getPort());
 
 			try {
-				restClusterClient.submitJob(jobGraph, ClassLoader.getSystemClassLoader());
-				fail("Expected exception not thrown.");
-			} catch (final ProgramInvocationException e) {
-				assertThat(e.getCause(), instanceOf(RuntimeException.class));
-				assertThat(e.getCause().getMessage(), equalTo("expected"));
+				JobExecutionResult jobExecutionResult;
+
+				jobExecutionResult = (JobExecutionResult) restClusterClient.submitJob(
+					jobGraph,
+					ClassLoader.getSystemClassLoader());
+				assertThat(jobExecutionResult.getJobID(), equalTo(jobId));
+				assertThat(jobExecutionResult.getNetRuntime(), equalTo(Long.MAX_VALUE));
+				assertThat(
+					jobExecutionResult.getAllAccumulatorResults(),
+					equalTo(Collections.singletonMap("testName", 1.0)));
+
+				try {
+					restClusterClient.submitJob(jobGraph, ClassLoader.getSystemClassLoader());
+					fail("Expected exception not thrown.");
+				} catch (final ProgramInvocationException e) {
+					final Optional<RuntimeException> cause = ExceptionUtils.findThrowable(e, RuntimeException.class);
+
+					assertThat(cause.isPresent(), is(true));
+					assertThat(cause.get().getMessage(), equalTo("expected"));
+				}
+			} finally {
+				restClusterClient.shutdown();
 			}
 		}
 	}
@@ -444,43 +440,48 @@ public class RestClusterClientTest extends TestLogger {
 		failHttpRequest = (messageHeaders, messageParameters, requestBody) ->
 			messageHeaders instanceof SavepointStatusHeaders && !firstPollFailed.getAndSet(true);
 
-		try (TestRestServerEndpoint ignored = createRestServerEndpoint(
+		try (TestRestServerEndpoint restServerEndpoint = createRestServerEndpoint(
 			triggerHandler,
 			savepointHandler)) {
-
-			JobID id = new JobID();
-			{
-				CompletableFuture<String> savepointPathFuture = restClusterClient.triggerSavepoint(id, null);
-				String savepointPath = savepointPathFuture.get();
-				assertEquals(savepointLocationDefaultDir, savepointPath);
-			}
-
-			{
-				CompletableFuture<String> savepointPathFuture = restClusterClient.triggerSavepoint(id, targetSavepointDirectory);
-				String savepointPath = savepointPathFuture.get();
-				assertEquals(savepointLocationRequestedDir, savepointPath);
-			}
-
-			{
-				try {
-					restClusterClient.triggerSavepoint(id, null).get();
-					fail("Expected exception not thrown.");
-				} catch (ExecutionException e) {
-					final Throwable cause = e.getCause();
-					assertThat(cause, instanceOf(SerializedThrowable.class));
-					assertThat(((SerializedThrowable) cause)
-						.deserializeError(ClassLoader.getSystemClassLoader())
-						.getMessage(), equalTo("expected"));
-				}
-			}
+			RestClusterClient<?> restClusterClient = createRestClusterClient(restServerEndpoint.getServerAddress().getPort());
 
 			try {
-				restClusterClient.triggerSavepoint(new JobID(), null).get();
-				fail("Expected exception not thrown.");
-			} catch (final ExecutionException e) {
-				assertTrue(
-					"RestClientException not in causal chain",
-					ExceptionUtils.findThrowable(e, RestClientException.class).isPresent());
+				JobID id = new JobID();
+				{
+					CompletableFuture<String> savepointPathFuture = restClusterClient.triggerSavepoint(id, null);
+					String savepointPath = savepointPathFuture.get();
+					assertEquals(savepointLocationDefaultDir, savepointPath);
+				}
+
+				{
+					CompletableFuture<String> savepointPathFuture = restClusterClient.triggerSavepoint(id, targetSavepointDirectory);
+					String savepointPath = savepointPathFuture.get();
+					assertEquals(savepointLocationRequestedDir, savepointPath);
+				}
+
+				{
+					try {
+						restClusterClient.triggerSavepoint(id, null).get();
+						fail("Expected exception not thrown.");
+					} catch (ExecutionException e) {
+						final Throwable cause = e.getCause();
+						assertThat(cause, instanceOf(SerializedThrowable.class));
+						assertThat(((SerializedThrowable) cause)
+							.deserializeError(ClassLoader.getSystemClassLoader())
+							.getMessage(), equalTo("expected"));
+					}
+				}
+
+				try {
+					restClusterClient.triggerSavepoint(new JobID(), null).get();
+					fail("Expected exception not thrown.");
+				} catch (final ExecutionException e) {
+					assertTrue(
+						"RestClientException not in causal chain",
+						ExceptionUtils.findThrowable(e, RestClientException.class).isPresent());
+				}
+			} finally {
+				restClusterClient.shutdown();
 			}
 		}
 	}
@@ -564,32 +565,38 @@ public class RestClusterClientTest extends TestLogger {
 			OptionalFailure.of(AsynchronousOperationInfo.completeExceptional(new SerializedThrowable(testException))),
 			OptionalFailure.ofFailure(testException));
 
-		try (TestRestServerEndpoint ignored = createRestServerEndpoint(
+		try (TestRestServerEndpoint restServerEndpoint = createRestServerEndpoint(
 			testSavepointDisposalStatusHandler,
 			testSavepointDisposalTriggerHandler)) {
-			{
-				final CompletableFuture<Acknowledge> disposeSavepointFuture = restClusterClient.disposeSavepoint(savepointPath);
-				assertThat(disposeSavepointFuture.get(), is(Acknowledge.get()));
-			}
+			RestClusterClient<?> restClusterClient = createRestClusterClient(restServerEndpoint.getServerAddress().getPort());
 
-			{
-				final CompletableFuture<Acknowledge> disposeSavepointFuture = restClusterClient.disposeSavepoint(savepointPath);
-
-				try {
-					disposeSavepointFuture.get();
-					fail("Expected an exception");
-				} catch (ExecutionException ee) {
-					assertThat(ExceptionUtils.findThrowableWithMessage(ee, exceptionMessage).isPresent(), is(true));
+			try {
+				{
+					final CompletableFuture<Acknowledge> disposeSavepointFuture = restClusterClient.disposeSavepoint(savepointPath);
+					assertThat(disposeSavepointFuture.get(), is(Acknowledge.get()));
 				}
-			}
 
-			{
-				try {
-					restClusterClient.disposeSavepoint(savepointPath).get();
-					fail("Expected an exception.");
-				} catch (ExecutionException ee) {
-					assertThat(ExceptionUtils.findThrowable(ee, RestClientException.class).isPresent(), is(true));
+				{
+					final CompletableFuture<Acknowledge> disposeSavepointFuture = restClusterClient.disposeSavepoint(savepointPath);
+
+					try {
+						disposeSavepointFuture.get();
+						fail("Expected an exception");
+					} catch (ExecutionException ee) {
+						assertThat(ExceptionUtils.findThrowableWithMessage(ee, exceptionMessage).isPresent(), is(true));
+					}
 				}
+
+				{
+					try {
+						restClusterClient.disposeSavepoint(savepointPath).get();
+						fail("Expected an exception.");
+					} catch (ExecutionException ee) {
+						assertThat(ExceptionUtils.findThrowable(ee, RestClientException.class).isPresent(), is(true));
+					}
+				}
+			} finally {
+				restClusterClient.shutdown();
 			}
 		}
 	}
@@ -650,14 +657,18 @@ public class RestClusterClientTest extends TestLogger {
 
 	@Test
 	public void testListJobs() throws Exception {
-		try (TestRestServerEndpoint ignored = createRestServerEndpoint(new TestListJobsHandler())) {
-			{
+		try (TestRestServerEndpoint restServerEndpoint = createRestServerEndpoint(new TestListJobsHandler())) {
+			RestClusterClient<?> restClusterClient = createRestClusterClient(restServerEndpoint.getServerAddress().getPort());
+
+			try {
 				CompletableFuture<Collection<JobStatusMessage>> jobDetailsFuture = restClusterClient.listJobs();
 				Collection<JobStatusMessage> jobDetails = jobDetailsFuture.get();
 				Iterator<JobStatusMessage> jobDetailsIterator = jobDetails.iterator();
 				JobStatusMessage job1 = jobDetailsIterator.next();
 				JobStatusMessage job2 = jobDetailsIterator.next();
 				Assert.assertNotEquals("The job status should not be equal.", job1.getJobState(), job2.getJobState());
+			} finally {
+				restClusterClient.shutdown();
 			}
 		}
 	}
@@ -666,17 +677,22 @@ public class RestClusterClientTest extends TestLogger {
 	public void testGetAccumulators() throws Exception {
 		TestAccumulatorHandler accumulatorHandler = new TestAccumulatorHandler();
 
-		try (TestRestServerEndpoint ignored = createRestServerEndpoint(accumulatorHandler)){
+		try (TestRestServerEndpoint restServerEndpoint = createRestServerEndpoint(accumulatorHandler)){
+			RestClusterClient<?> restClusterClient = createRestClusterClient(restServerEndpoint.getServerAddress().getPort());
 
-			JobID id = new JobID();
+			try {
+				JobID id = new JobID();
 
-			{
-				Map<String, OptionalFailure<Object>> accumulators = restClusterClient.getAccumulators(id);
-				assertNotNull(accumulators);
-				assertEquals(1, accumulators.size());
+				{
+					Map<String, OptionalFailure<Object>> accumulators = restClusterClient.getAccumulators(id);
+					assertNotNull(accumulators);
+					assertEquals(1, accumulators.size());
 
-				assertEquals(true, accumulators.containsKey("testKey"));
-				assertEquals("testValue", accumulators.get("testKey").get().toString());
+					assertEquals(true, accumulators.containsKey("testKey"));
+					assertEquals("testValue", accumulators.get("testKey").get().toString());
+				}
+			} finally {
+				restClusterClient.shutdown();
 			}
 		}
 	}
@@ -710,6 +726,114 @@ public class RestClusterClientTest extends TestLogger {
 		URL webMonitorBaseUrl = clusterClient.getWebMonitorBaseUrl().get();
 		assertThat(webMonitorBaseUrl.getHost(), equalTo(manualHostname));
 		assertThat(webMonitorBaseUrl.getPort(), equalTo(manualPort));
+	}
+
+	/**
+	 * Tests that the send operation is being retried.
+	 */
+	@Test
+	public void testRetriableSendOperationIfConnectionErrorOrServiceUnavailable() throws Exception {
+		final PingRestHandler pingRestHandler = new PingRestHandler(
+			FutureUtils.completedExceptionally(new RestHandlerException("test exception", HttpResponseStatus.SERVICE_UNAVAILABLE)),
+			CompletableFuture.completedFuture(EmptyResponseBody.getInstance()));
+
+		try (final TestRestServerEndpoint restServerEndpoint = createRestServerEndpoint(pingRestHandler)) {
+			RestClusterClient<?> restClusterClient = createRestClusterClient(restServerEndpoint.getServerAddress().getPort());
+
+			try {
+				final AtomicBoolean firstPollFailed = new AtomicBoolean();
+				failHttpRequest = (messageHeaders, messageParameters, requestBody) ->
+					messageHeaders instanceof PingRestHandlerHeaders && !firstPollFailed.getAndSet(true);
+
+				restClusterClient.sendRequest(PingRestHandlerHeaders.INSTANCE).get();
+			} finally {
+				restClusterClient.shutdown();
+			}
+		}
+	}
+
+	/**
+	 * Tests that the send operation is not being retried when receiving a NOT_FOUND return code.
+	 */
+	@Test
+	public void testSendIsNotRetriableIfHttpNotFound() throws Exception {
+		final String exceptionMessage = "test exception";
+		final PingRestHandler pingRestHandler = new PingRestHandler(
+			FutureUtils.completedExceptionally(new RestHandlerException(exceptionMessage, HttpResponseStatus.NOT_FOUND)));
+
+		try (final TestRestServerEndpoint restServerEndpoint = createRestServerEndpoint(pingRestHandler)) {
+			RestClusterClient<?> restClusterClient = createRestClusterClient(restServerEndpoint.getServerAddress().getPort());
+
+			try {
+				restClusterClient.sendRequest(PingRestHandlerHeaders.INSTANCE).get();
+				fail("The rest request should have failed.");
+			}  catch (Exception e) {
+				assertThat(ExceptionUtils.findThrowableWithMessage(e, exceptionMessage).isPresent(), is(true));
+			} finally {
+				restClusterClient.shutdown();
+			}
+		}
+	}
+
+	private class PingRestHandler extends TestHandler<EmptyRequestBody, EmptyResponseBody, EmptyMessageParameters> {
+
+		private final Queue<CompletableFuture<EmptyResponseBody>> responseQueue;
+
+		private PingRestHandler(CompletableFuture<EmptyResponseBody> ... responses) {
+			super(PingRestHandlerHeaders.INSTANCE);
+			responseQueue = new ArrayDeque<>(Arrays.asList(responses));
+		}
+
+		@Override
+		protected CompletableFuture<EmptyResponseBody> handleRequest(@Nonnull HandlerRequest<EmptyRequestBody, EmptyMessageParameters> request, @Nonnull DispatcherGateway gateway) throws RestHandlerException {
+			final CompletableFuture<EmptyResponseBody> result = responseQueue.poll();
+
+			if (result != null) {
+				return result;
+			} else {
+				return CompletableFuture.completedFuture(EmptyResponseBody.getInstance());
+			}
+		}
+	}
+
+	private static final class PingRestHandlerHeaders implements MessageHeaders<EmptyRequestBody, EmptyResponseBody, EmptyMessageParameters> {
+
+		static final PingRestHandlerHeaders INSTANCE = new PingRestHandlerHeaders();
+
+		@Override
+		public Class<EmptyResponseBody> getResponseClass() {
+			return EmptyResponseBody.class;
+		}
+
+		@Override
+		public HttpResponseStatus getResponseStatusCode() {
+			return HttpResponseStatus.OK;
+		}
+
+		@Override
+		public String getDescription() {
+			return "foobar";
+		}
+
+		@Override
+		public Class<EmptyRequestBody> getRequestClass() {
+			return EmptyRequestBody.class;
+		}
+
+		@Override
+		public EmptyMessageParameters getUnresolvedMessageParameters() {
+			return EmptyMessageParameters.getInstance();
+		}
+
+		@Override
+		public HttpMethodWrapper getHttpMethod() {
+			return HttpMethodWrapper.GET;
+		}
+
+		@Override
+		public String getTargetRestEndpointURL() {
+			return "/foobar";
+		}
 	}
 
 	private class TestAccumulatorHandler extends TestHandler<EmptyRequestBody, JobAccumulatorsInfo, JobAccumulatorsMessageParameters> {
@@ -772,7 +896,6 @@ public class RestClusterClientTest extends TestLogger {
 
 		private TestHandler(MessageHeaders<R, P, M> headers) {
 			super(
-				CompletableFuture.completedFuture(REST_ADDRESS),
 				mockGatewayRetriever,
 				RpcUtils.INF_TIMEOUT,
 				Collections.emptyMap(),
@@ -797,8 +920,7 @@ public class RestClusterClientTest extends TestLogger {
 		}
 
 		@Override
-		protected List<Tuple2<RestHandlerSpecification, ChannelInboundHandler>>
-				initializeHandlers(CompletableFuture<String> restAddressFuture) {
+		protected List<Tuple2<RestHandlerSpecification, ChannelInboundHandler>> initializeHandlers(final CompletableFuture<String> localAddressFuture) {
 			final List<Tuple2<RestHandlerSpecification, ChannelInboundHandler>> handlers = new ArrayList<>();
 			for (final AbstractRestHandler abstractRestHandler : abstractRestHandlers) {
 				handlers.add(Tuple2.of(

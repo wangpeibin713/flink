@@ -701,12 +701,11 @@ public class Configuration extends ExecutionConfig.GlobalJobParameters
 			if (this.confData.containsKey(configOption.key())) {
 				return true;
 			}
-			else if (configOption.hasDeprecatedKeys()) {
-				// try the deprecated keys
-				for (String deprecatedKey : configOption.deprecatedKeys()) {
-					if (this.confData.containsKey(deprecatedKey)) {
-						LOG.warn("Config uses deprecated configuration key '{}' instead of proper key '{}'",
-							deprecatedKey, configOption.key());
+			else if (configOption.hasFallbackKeys()) {
+				// try the fallback keys
+				for (FallbackKey fallbackKey : configOption.fallbackKeys()) {
+					if (this.confData.containsKey(fallbackKey.getKey())) {
+						loggingFallback(fallbackKey, configOption);
 						return true;
 					}
 				}
@@ -726,6 +725,31 @@ public class Configuration extends ExecutionConfig.GlobalJobParameters
 				ret.put(entry.getKey(), entry.getValue().toString());
 			}
 			return ret;
+		}
+	}
+
+	/**
+	 * Removes given config option from the configuration.
+	 *
+	 * @param configOption config option to remove
+	 * @param <T> Type of the config option
+	 * @return true is config has been removed, false otherwise
+	 */
+	public <T> boolean removeConfig(ConfigOption<T> configOption){
+		synchronized (this.confData){
+			// try the current key
+			Object oldValue = this.confData.remove(configOption.key());
+			if (oldValue == null){
+				for (FallbackKey fallbackKey : configOption.fallbackKeys()){
+					oldValue = this.confData.remove(fallbackKey.getKey());
+					if (oldValue != null){
+						loggingFallback(fallbackKey, configOption);
+						return true;
+					}
+				}
+				return false;
+			}
+			return true;
 		}
 	}
 
@@ -763,13 +787,12 @@ public class Configuration extends ExecutionConfig.GlobalJobParameters
 			// found a value for the current proper key
 			return o;
 		}
-		else if (configOption.hasDeprecatedKeys()) {
+		else if (configOption.hasFallbackKeys()) {
 			// try the deprecated keys
-			for (String deprecatedKey : configOption.deprecatedKeys()) {
-				Object oo = getRawValue(deprecatedKey);
+			for (FallbackKey fallbackKey : configOption.fallbackKeys()) {
+				Object oo = getRawValue(fallbackKey.getKey());
 				if (oo != null) {
-					LOG.warn("Config uses deprecated configuration key '{}' instead of proper key '{}'",
-							deprecatedKey, configOption.key());
+					loggingFallback(fallbackKey, configOption);
 					return oo;
 				}
 			}
@@ -781,6 +804,16 @@ public class Configuration extends ExecutionConfig.GlobalJobParameters
 	private Object getValueOrDefaultFromOption(ConfigOption<?> configOption) {
 		Object o = getRawValueFromOption(configOption);
 		return o != null ? o : configOption.defaultValue();
+	}
+
+	private void loggingFallback(FallbackKey fallbackKey, ConfigOption<?> configOption) {
+		if (fallbackKey.isDeprecated()) {
+			LOG.warn("Config uses deprecated configuration key '{}' instead of proper key '{}'",
+				fallbackKey.getKey(), configOption.key());
+		} else {
+			LOG.info("Config uses fallback configuration key '{}' instead of key '{}'",
+				fallbackKey.getKey(), configOption.key());
+		}
 	}
 
 	// --------------------------------------------------------------------------------------------

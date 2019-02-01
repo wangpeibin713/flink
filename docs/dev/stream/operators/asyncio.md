@@ -154,11 +154,11 @@ class AsyncDatabaseRequest extends AsyncFunction[String, (String, String)] {
     override def asyncInvoke(str: String, resultFuture: ResultFuture[(String, String)]): Unit = {
 
         // issue the asynchronous request, receive a future for the result
-        val resultFuture: Future[String] = client.query(str)
+        val resultFutureRequested: Future[String] = client.query(str)
 
         // set the callback to be executed once the request by the client is complete
         // the callback simply forwards the result to the result future
-        resultFuture.onSuccess {
+        resultFutureRequested.onSuccess {
             case result: String => resultFuture.complete(Iterable((str, result)))
         }
     }
@@ -188,6 +188,12 @@ The following two parameters control the asynchronous operations:
     the streaming application. Limiting the number of concurrent requests ensures that the operator will not
     accumulate an ever-growing backlog of pending requests, but that it will trigger backpressure once the capacity
     is exhausted.
+
+
+### Timeout Handling
+
+When an async I/O request times out, by default an exception is thrown and job is restarted.
+If you want to handle timeouts, you can override the `AsyncFunction#timeout` method.
 
 
 ### Order of Results

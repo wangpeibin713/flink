@@ -19,16 +19,12 @@
 package org.apache.flink.configuration;
 
 import org.apache.flink.annotation.PublicEvolving;
-import org.apache.flink.annotation.docs.ConfigGroup;
-import org.apache.flink.annotation.docs.ConfigGroups;
+import org.apache.flink.configuration.description.Description;
 
 /**
  * The set of configuration options relating to the ResourceManager.
  */
 @PublicEvolving
-@ConfigGroups(groups = {
-	@ConfigGroup(name = "SlotManager", keyPrefix = "slotmanager")
-})
 public class ResourceManagerOptions {
 
 	/**
@@ -39,10 +35,19 @@ public class ResourceManagerOptions {
 		.defaultValue("5 minutes")
 		.withDescription("Timeout for jobs which don't have a job manager as leader assigned.");
 
+	/**
+	 * The number of resource managers start.
+	 */
 	public static final ConfigOption<Integer> LOCAL_NUMBER_RESOURCE_MANAGER = ConfigOptions
 		.key("local.number-resourcemanager")
-		.defaultValue(1);
+		.defaultValue(1)
+		.withDescription("The number of resource managers start.");
 
+	/**
+	 * Defines the network port to connect to for communication with the resource manager.
+	 * By default, the port of the JobManager, because the same ActorSystem is used. Its not
+	 * possible to use this configuration key to define port ranges.
+	 */
 	public static final ConfigOption<Integer> IPC_PORT = ConfigOptions
 		.key("resourcemanager.rpc.port")
 		.defaultValue(0)
@@ -72,19 +77,34 @@ public class ResourceManagerOptions {
 
 	/**
 	 * The timeout for a slot request to be discarded, in milliseconds.
+	 * @deprecated Use {@link JobManagerOptions#SLOT_REQUEST_TIMEOUT}.
 	 */
+	@Deprecated
 	public static final ConfigOption<Long> SLOT_REQUEST_TIMEOUT = ConfigOptions
 		.key("slotmanager.request-timeout")
-		.defaultValue(600000L)
+		.defaultValue(-1L)
 		.withDescription("The timeout for a slot request to be discarded.");
+
+	/**
+	 * The timeout for an idle task manager to be released, in milliseconds.
+	 * @deprecated Use {@link #TASK_MANAGER_TIMEOUT}.
+	 */
+	@Deprecated
+	public static final ConfigOption<Long> SLOT_MANAGER_TASK_MANAGER_TIMEOUT = ConfigOptions
+		.key("slotmanager.taskmanager-timeout")
+		.defaultValue(30000L)
+		.withDescription("The timeout for an idle task manager to be released.");
 
 	/**
 	 * The timeout for an idle task manager to be released, in milliseconds.
 	 */
 	public static final ConfigOption<Long> TASK_MANAGER_TIMEOUT = ConfigOptions
-		.key("slotmanager.taskmanager-timeout")
+		.key("resourcemanager.taskmanager-timeout")
 		.defaultValue(30000L)
-		.withDescription("The timeout for an idle task manager to be released.");
+		.withDeprecatedKeys(SLOT_MANAGER_TASK_MANAGER_TIMEOUT.key())
+		.withDescription(Description.builder()
+			.text("The timeout for an idle task manager to be released.")
+			.build());
 
 	/**
 	 * Prefix for passing custom environment variables to Flink's master process.

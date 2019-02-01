@@ -20,6 +20,7 @@ package org.apache.flink.runtime.executiongraph;
 
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.Archiveable;
+import org.apache.flink.api.common.InputDependencyConstraint;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.time.Time;
 import org.apache.flink.configuration.JobManagerOptions;
@@ -33,9 +34,7 @@ import org.apache.flink.runtime.deployment.PartialInputChannelDeploymentDescript
 import org.apache.flink.runtime.deployment.ResultPartitionDeploymentDescriptor;
 import org.apache.flink.runtime.deployment.TaskDeploymentDescriptor;
 import org.apache.flink.runtime.execution.ExecutionState;
-import org.apache.flink.runtime.jobmaster.LogicalSlot;
 import org.apache.flink.runtime.instance.SimpleSlot;
-import org.apache.flink.runtime.jobmaster.slotpool.SlotProvider;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionType;
 import org.apache.flink.runtime.jobgraph.DistributionPattern;
@@ -46,6 +45,8 @@ import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobmanager.scheduler.CoLocationConstraint;
 import org.apache.flink.runtime.jobmanager.scheduler.CoLocationGroup;
 import org.apache.flink.runtime.jobmanager.scheduler.LocationPreferenceConstraint;
+import org.apache.flink.runtime.jobmaster.LogicalSlot;
+import org.apache.flink.runtime.jobmaster.slotpool.SlotProvider;
 import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
 import org.apache.flink.runtime.taskmanager.TaskManagerLocation;
 import org.apache.flink.runtime.util.EvictingBoundedList;
@@ -56,10 +57,12 @@ import org.apache.flink.util.SerializedValue;
 
 import org.slf4j.Logger;
 
+import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
@@ -69,6 +72,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.stream.IntStream;
 
 import static org.apache.flink.runtime.execution.ExecutionState.FINISHED;
 
@@ -92,16 +96,16 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 
 	private final int subTaskIndex;
 
-	private final EvictingBoundedList<Execution> priorExecutions;
+	private final EvictingBoundedList<ArchivedExecution> priorExecutions;
 
 	private final Time timeout;
 
-	/** The name in the format "myTask (2/7)", cached to avoid frequent string concatenations */
+	/** The name in the format "myTask (2/7)", cached to avoid frequent string concatenations. */
 	private final String taskNameWithSubtask;
 
 	private volatile CoLocationConstraint locationConstraint;
 
-	/** The current or latest execution attempt of this vertex's task */
+	/** The current or latest execution attempt of this vertex's task. */
 	private volatile Execution currentExecution;	// this field must never be null
 
 	// --------------------------------------------------------------------------------------------
@@ -117,17 +121,18 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 			Time timeout) {
 
 		this(
-				jobVertex,
-				subTaskIndex,
-				producedDataSets,
-				timeout,
-				1L,
-				System.currentTimeMillis(),
-				JobManagerOptions.MAX_ATTEMPTS_HISTORY_SIZE.defaultValue());
+			jobVertex,
+			subTaskIndex,
+			producedDataSets,
+			timeout,
+			1L,
+			System.currentTimeMillis(),
+			JobManagerOptions.MAX_ATTEMPTS_HISTORY_SIZE.defaultValue());
 	}
 
 	/**
-	 * 
+	 * Creates an ExecutionVertex.
+	 *
 	 * @param timeout
 	 *            The RPC timeout to use for deploy / cancel calls
 	 * @param initialGlobalModVersion
@@ -286,7 +291,7 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 	}
 
 	@Override
-	public Execution getPriorExecutionAttempt(int attemptNumber) {
+	public ArchivedExecution getPriorExecutionAttempt(int attemptNumber) {
 		synchronized (priorExecutions) {
 			if (attemptNumber >= 0 && attemptNumber < priorExecutions.size()) {
 				return priorExecutions.get(attemptNumber);
@@ -296,7 +301,7 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 		}
 	}
 
-	public Execution getLatestPriorExecution() {
+	public ArchivedExecution getLatestPriorExecution() {
 		synchronized (priorExecutions) {
 			final int size = priorExecutions.size();
 			if (size > 0) {
@@ -311,20 +316,20 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 	/**
 	 * Gets the location where the latest completed/canceled/failed execution of the vertex's
 	 * task happened.
-	 * 
+	 *
 	 * @return The latest prior execution location, or null, if there is none, yet.
 	 */
 	public TaskManagerLocation getLatestPriorLocation() {
-		Execution latestPriorExecution = getLatestPriorExecution();
+		ArchivedExecution latestPriorExecution = getLatestPriorExecution();
 		return latestPriorExecution != null ? latestPriorExecution.getAssignedResourceLocation() : null;
 	}
 
 	public AllocationID getLatestPriorAllocation() {
-		Execution latestPriorExecution = getLatestPriorExecution();
+		ArchivedExecution latestPriorExecution = getLatestPriorExecution();
 		return latestPriorExecution != null ? latestPriorExecution.getAssignedAllocationID() : null;
 	}
 
-	EvictingBoundedList<Execution> getCopyOfPriorExecutionsList() {
+	EvictingBoundedList<ArchivedExecution> getCopyOfPriorExecutionsList() {
 		synchronized (priorExecutions) {
 			return new EvictingBoundedList<>(priorExecutions);
 		}
@@ -336,6 +341,10 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 
 	public Map<IntermediateResultPartitionID, IntermediateResultPartition> getProducedPartitions() {
 		return resultPartitions;
+	}
+
+	public InputDependencyConstraint getInputDependencyConstraint() {
+		return getJobVertex().getInputDependencyConstraint();
 	}
 
 	// --------------------------------------------------------------------------------------------
@@ -444,36 +453,36 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 	/**
 	 * Gets the overall preferred execution location for this vertex's current execution.
 	 * The preference is determined as follows:
-	 * 
+	 *
 	 * <ol>
 	 *     <li>If the task execution has state to load (from a checkpoint), then the location preference
 	 *         is the location of the previous execution (if there is a previous execution attempt).
 	 *     <li>If the task execution has no state or no previous location, then the location preference
 	 *         is based on the task's inputs.
 	 * </ol>
-	 * 
-	 * These rules should result in the following behavior:
-	 * 
+	 *
+	 * <p>These rules should result in the following behavior:
+	 *
 	 * <ul>
 	 *     <li>Stateless tasks are always scheduled based on co-location with inputs.
 	 *     <li>Stateful tasks are on their initial attempt executed based on co-location with inputs.
 	 *     <li>Repeated executions of stateful tasks try to co-locate the execution with its state.
 	 * </ul>
-	 * 
-	 * @return The preferred execution locations for the execution attempt.
-	 * 
+	 *
 	 * @see #getPreferredLocationsBasedOnState()
-	 * @see #getPreferredLocationsBasedOnInputs() 
+	 * @see #getPreferredLocationsBasedOnInputs()
+	 *
+	 * @return The preferred execution locations for the execution attempt.
 	 */
 	public Collection<CompletableFuture<TaskManagerLocation>> getPreferredLocations() {
 		Collection<CompletableFuture<TaskManagerLocation>> basedOnState = getPreferredLocationsBasedOnState();
 		return basedOnState != null ? basedOnState : getPreferredLocationsBasedOnInputs();
 	}
-	
+
 	/**
 	 * Gets the preferred location to execute the current task execution attempt, based on the state
 	 * that the execution attempt will resume.
-	 * 
+	 *
 	 * @return A size-one collection with the location preference, or null, if there is no
 	 *         location preference based on the state.
 	 */
@@ -542,27 +551,25 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 
 	/**
 	 * Archives the current Execution and creates a new Execution for this vertex.
-	 * 
+	 *
 	 * <p>This method atomically checks if the ExecutionGraph is still of an expected
 	 * global mod. version and replaces the execution if that is the case. If the ExecutionGraph
 	 * has increased its global mod. version in the meantime, this operation fails.
-	 * 
+	 *
 	 * <p>This mechanism can be used to prevent conflicts between various concurrent recovery and
 	 * reconfiguration actions in a similar way as "optimistic concurrency control".
-	 * 
+	 *
 	 * @param timestamp
 	 *             The creation timestamp for the new Execution
 	 * @param originatingGlobalModVersion
-	 *             The 
-	 * 
-	 * @return Returns the new created Execution. 
-	 * 
+	 *
+	 * @return Returns the new created Execution.
+	 *
 	 * @throws GlobalModVersionMismatch Thrown, if the execution graph has a new global mod
 	 *                                  version than the one passed to this message.
 	 */
 	public Execution resetForNewExecution(final long timestamp, final long originatingGlobalModVersion)
-			throws GlobalModVersionMismatch
-	{
+			throws GlobalModVersionMismatch {
 		LOG.debug("Resetting execution vertex {} for new execution.", getTaskNameWithSubtaskIndex());
 
 		synchronized (priorExecutions) {
@@ -578,7 +585,7 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 			final ExecutionState oldState = oldExecution.getState();
 
 			if (oldState.isTerminal()) {
-				priorExecutions.add(oldExecution);
+				priorExecutions.add(oldExecution.archive());
 
 				final Execution newExecution = new Execution(
 					getExecutionGraph().getFutureExecutor(),
@@ -618,17 +625,21 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 	 * @param slotProvider to allocate the slots from
 	 * @param queued if the allocation can be queued
 	 * @param locationPreferenceConstraint constraint for the location preferences
+	 * @param allPreviousExecutionGraphAllocationIds set with all previous allocation ids in the job graph.
+	 *                                                 Can be empty if the allocation ids are not required for scheduling.
 	 * @return Future which is completed once the execution is deployed. The future
 	 * can also completed exceptionally.
 	 */
 	public CompletableFuture<Void> scheduleForExecution(
 			SlotProvider slotProvider,
 			boolean queued,
-			LocationPreferenceConstraint locationPreferenceConstraint) {
+			LocationPreferenceConstraint locationPreferenceConstraint,
+			@Nonnull Set<AllocationID> allPreviousExecutionGraphAllocationIds) {
 		return this.currentExecution.scheduleForExecution(
 			slotProvider,
 			queued,
-			locationPreferenceConstraint);
+			locationPreferenceConstraint,
+			allPreviousExecutionGraphAllocationIds);
 	}
 
 	@VisibleForTesting
@@ -642,12 +653,13 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 	}
 
 	/**
-	 *  
+	 * Cancels this ExecutionVertex.
+	 *
 	 * @return A future that completes once the execution has reached its final state.
 	 */
 	public CompletableFuture<?> cancel() {
 		// to avoid any case of mixup in the presence of concurrent calls,
-		// we copy a reference to the stack to make sure both calls go to the same Execution 
+		// we copy a reference to the stack to make sure both calls go to the same Execution
 		final Execution exec = this.currentExecution;
 		exec.cancel();
 		return exec.getReleaseFuture();
@@ -678,6 +690,8 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 		if (partition == null) {
 			throw new IllegalStateException("Unknown partition " + partitionId + ".");
 		}
+
+		partition.markDataProduced();
 
 		if (partition.getIntermediateResult().getResultType().isPipelined()) {
 			// Schedule or update receivers of this partition
@@ -721,6 +735,34 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 		}
 	}
 
+	/**
+	 * Check whether the InputDependencyConstraint is satisfied for this vertex.
+	 *
+	 * @return whether the input constraint is satisfied
+	 */
+	boolean checkInputDependencyConstraints() {
+		if (getInputDependencyConstraint() == InputDependencyConstraint.ANY) {
+			// InputDependencyConstraint == ANY
+			return IntStream.range(0, inputEdges.length).anyMatch(this::isInputConsumable);
+		} else {
+			// InputDependencyConstraint == ALL
+			return IntStream.range(0, inputEdges.length).allMatch(this::isInputConsumable);
+		}
+	}
+
+	/**
+	 * Get whether an input of the vertex is consumable.
+	 * An input is consumable when when any partition in it is consumable.
+	 *
+	 * Note that a BLOCKING result partition is only consumable when all partitions in the result are FINISHED.
+	 *
+	 * @return whether the input is consumable
+	 */
+	boolean isInputConsumable(int inputNumber) {
+		return Arrays.stream(inputEdges[inputNumber]).map(ExecutionEdge::getSource).anyMatch(
+				IntermediateResultPartition::isConsumable);
+	}
+
 	// --------------------------------------------------------------------------------------------
 	//   Notifications from the Execution Attempt
 	// --------------------------------------------------------------------------------------------
@@ -742,7 +784,7 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 	// --------------------------------------------------------------------------------------------
 
 	/**
-	 * Simply forward this notification
+	 * Simply forward this notification.
 	 */
 	void notifyStateTransition(Execution execution, ExecutionState newState, Throwable error) {
 		// only forward this notification if the execution is still the current execution
@@ -754,7 +796,6 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 
 	/**
 	 * Creates a task deployment descriptor to deploy a subtask to the given target slot.
-	 *
 	 * TODO: This should actually be in the EXECUTION
 	 */
 	TaskDeploymentDescriptor createDeploymentDescriptor(
@@ -762,13 +803,13 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 			LogicalSlot targetSlot,
 			@Nullable JobManagerTaskRestore taskRestore,
 			int attemptNumber) throws ExecutionGraphException {
-		
+
 		// Produced intermediate results
 		List<ResultPartitionDeploymentDescriptor> producedPartitions = new ArrayList<>(resultPartitions.size());
-		
+
 		// Consumed intermediate results
 		List<InputGateDeploymentDescriptor> consumedPartitions = new ArrayList<>(inputEdges.length);
-		
+
 		boolean lazyScheduling = getExecutionGraph().getScheduleMode().allowLazyDeployment();
 
 		for (IntermediateResultPartition partition : resultPartitions.values()) {
@@ -791,8 +832,7 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 				producedPartitions.add(ResultPartitionDeploymentDescriptor.from(partition, maxParallelism, lazyScheduling));
 			}
 		}
-		
-		
+
 		for (ExecutionEdge[] edges : inputEdges) {
 			InputChannelDeploymentDescriptor[] partitions = InputChannelDeploymentDescriptor.fromEdges(
 				edges,

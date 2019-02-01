@@ -20,6 +20,7 @@ package org.apache.flink.runtime.executiongraph;
 
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.Archiveable;
+import org.apache.flink.api.common.InputDependencyConstraint;
 import org.apache.flink.api.common.accumulators.Accumulator;
 import org.apache.flink.api.common.time.Time;
 import org.apache.flink.runtime.JobException;
@@ -41,6 +42,7 @@ import org.apache.flink.runtime.io.network.ConnectionID;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
 import org.apache.flink.runtime.jobmanager.scheduler.CoLocationConstraint;
 import org.apache.flink.runtime.jobmanager.scheduler.LocationPreferenceConstraint;
+import org.apache.flink.runtime.jobmanager.scheduler.NoResourceAvailableException;
 import org.apache.flink.runtime.jobmanager.scheduler.ScheduledUnit;
 import org.apache.flink.runtime.jobmanager.scheduler.SlotSharingGroup;
 import org.apache.flink.runtime.jobmanager.slots.TaskManagerGateway;
@@ -54,9 +56,11 @@ import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.FlinkException;
 import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.OptionalFailure;
+import org.apache.flink.util.concurrent.FutureConsumerWithException;
 
 import org.slf4j.Logger;
 
+import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
 import java.util.ArrayList;
@@ -64,6 +68,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -179,7 +184,7 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 
 	/**
 	 * Creates a new Execution attempt.
-	 * 
+	 *
 	 * @param executor
 	 *             The executor used to dispatch callbacks from futures and asynchronous RPC calls.
 	 * @param vertex
@@ -250,7 +255,7 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 
 	/**
 	 * Gets the global modification version of the execution graph when this execution was created.
-	 * 
+	 *
 	 * <p>This version is bumped in the ExecutionGraph whenever a global failover happens. It is used
 	 * to resolve conflicts between concurrent modification by global and local failover actions.
 	 */
@@ -280,15 +285,19 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 		// only allow to set the assigned resource in state SCHEDULED or CREATED
 		// note: we also accept resource assignment when being in state CREATED for testing purposes
 		if (state == SCHEDULED || state == CREATED) {
-			if (ASSIGNED_SLOT_UPDATER.compareAndSet(this, null, logicalSlot) && logicalSlot.tryAssignPayload(this)) {
-				// check for concurrent modification (e.g. cancelling call)
-				if (state == SCHEDULED || state == CREATED) {
-					checkState(!taskManagerLocationFuture.isDone(), "The TaskManagerLocationFuture should not be set if we haven't assigned a resource yet.");
-					taskManagerLocationFuture.complete(logicalSlot.getTaskManagerLocation());
-					assignedAllocationID = logicalSlot.getAllocationId();
-					return true;
+			if (ASSIGNED_SLOT_UPDATER.compareAndSet(this, null, logicalSlot)) {
+				if (logicalSlot.tryAssignPayload(this)) {
+					// check for concurrent modification (e.g. cancelling call)
+					if ((state == SCHEDULED || state == CREATED) && !taskManagerLocationFuture.isDone()) {
+						taskManagerLocationFuture.complete(logicalSlot.getTaskManagerLocation());
+						assignedAllocationID = logicalSlot.getAllocationId();
+						return true;
+					} else {
+						// free assigned resource and return false
+						ASSIGNED_SLOT_UPDATER.set(this, null);
+						return false;
+					}
 				} else {
-					// free assigned resource and return false
 					ASSIGNED_SLOT_UPDATER.set(this, null);
 					return false;
 				}
@@ -380,53 +389,64 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 		return scheduleForExecution(
 			resourceProvider,
 			allowQueued,
-			LocationPreferenceConstraint.ANY);
+			LocationPreferenceConstraint.ANY,
+			Collections.emptySet());
 	}
 
 	/**
 	 * NOTE: This method only throws exceptions if it is in an illegal state to be scheduled, or if the tasks needs
 	 *       to be scheduled immediately and no resource is available. If the task is accepted by the schedule, any
 	 *       error sets the vertex state to failed and triggers the recovery logic.
-	 * 
+	 *
 	 * @param slotProvider The slot provider to use to allocate slot for this execution attempt.
 	 * @param queued Flag to indicate whether the scheduler may queue this task if it cannot
 	 *               immediately deploy it.
 	 * @param locationPreferenceConstraint constraint for the location preferences
+	 * @param allPreviousExecutionGraphAllocationIds set with all previous allocation ids in the job graph.
+	 *                                                 Can be empty if the allocation ids are not required for scheduling.
 	 * @return Future which is completed once the Execution has been deployed
 	 */
 	public CompletableFuture<Void> scheduleForExecution(
 			SlotProvider slotProvider,
 			boolean queued,
-			LocationPreferenceConstraint locationPreferenceConstraint) {
+			LocationPreferenceConstraint locationPreferenceConstraint,
+			@Nonnull Set<AllocationID> allPreviousExecutionGraphAllocationIds) {
 		final Time allocationTimeout = vertex.getExecutionGraph().getAllocationTimeout();
 		try {
 			final CompletableFuture<Execution> allocationFuture = allocateAndAssignSlotForExecution(
 				slotProvider,
 				queued,
 				locationPreferenceConstraint,
+				allPreviousExecutionGraphAllocationIds,
 				allocationTimeout);
 
 			// IMPORTANT: We have to use the synchronous handle operation (direct executor) here so
 			// that we directly deploy the tasks if the slot allocation future is completed. This is
 			// necessary for immediate deployment.
-			final CompletableFuture<Void> deploymentFuture = allocationFuture.handle(
-				(Execution ignored, Throwable throwable) -> {
-					if (throwable != null) {
-						markFailed(ExceptionUtils.stripCompletionException(throwable));
-					} else {
-						try {
-							deploy();
-						} catch (Throwable t) {
-							markFailed(ExceptionUtils.stripCompletionException(t));
+			final CompletableFuture<Void> deploymentFuture = allocationFuture.thenAccept(
+				(FutureConsumerWithException<Execution, Exception>) value -> deploy());
+
+			deploymentFuture.whenComplete(
+				(Void ignored, Throwable failure) -> {
+					if (failure != null) {
+						final Throwable stripCompletionException = ExceptionUtils.stripCompletionException(failure);
+						final Throwable schedulingFailureCause;
+
+						if (stripCompletionException instanceof TimeoutException) {
+							schedulingFailureCause = new NoResourceAvailableException(
+								"Could not allocate enough slots within timeout of " + allocationTimeout + " to run the job. " +
+									"Please make sure that the cluster has enough resources.");
+						} else {
+							schedulingFailureCause = stripCompletionException;
 						}
+
+						markFailed(schedulingFailureCause);
 					}
-					return null;
-				}
-			);
+				});
 
 			// if tasks have to scheduled immediately check that the task has been deployed
 			if (!queued && !deploymentFuture.isDone()) {
-				allocationFuture.completeExceptionally(new IllegalArgumentException("The slot allocation future has not been completed yet."));
+				deploymentFuture.completeExceptionally(new IllegalArgumentException("The slot allocation future has not been completed yet."));
 			}
 
 			return deploymentFuture;
@@ -441,6 +461,8 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 	 * @param slotProvider to obtain a new slot from
 	 * @param queued if the allocation can be queued
 	 * @param locationPreferenceConstraint constraint for the location preferences
+	 * @param allPreviousExecutionGraphAllocationIds set with all previous allocation ids in the job graph.
+	 *                                                 Can be empty if the allocation ids are not required for scheduling.
 	 * @param allocationTimeout rpcTimeout for allocating a new slot
 	 * @return Future which is completed with this execution once the slot has been assigned
 	 * 			or with an exception if an error occurred.
@@ -450,6 +472,7 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 			SlotProvider slotProvider,
 			boolean queued,
 			LocationPreferenceConstraint locationPreferenceConstraint,
+			@Nonnull Set<AllocationID> allPreviousExecutionGraphAllocationIds,
 			Time allocationTimeout) throws IllegalExecutionStateException {
 
 		checkNotNull(slotProvider);
@@ -495,7 +518,8 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 							new SlotProfile(
 								ResourceProfile.UNKNOWN,
 								preferredLocations,
-								previousAllocationIDs),
+								previousAllocationIDs,
+								allPreviousExecutionGraphAllocationIds),
 							allocationTimeout));
 
 			// register call back to cancel slot request in case that the execution gets canceled
@@ -574,7 +598,7 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 
 			if (LOG.isInfoEnabled()) {
 				LOG.info(String.format("Deploying %s (attempt #%d) to %s", vertex.getTaskNameWithSubtaskIndex(),
-						attemptNumber, getAssignedResourceLocation().getHostname()));
+						attemptNumber, getAssignedResourceLocation()));
 			}
 
 			final TaskDeploymentDescriptor deployment = vertex.createDeploymentDescriptor(
@@ -582,6 +606,9 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 				slot,
 				taskRestore,
 				attemptNumber);
+
+			// null taskRestore to let it be GC'ed
+			taskRestore = null;
 
 			final TaskManagerGateway taskManagerGateway = slot.getTaskManagerGateway();
 
@@ -692,6 +719,26 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 		}
 	}
 
+	private void scheduleConsumer(ExecutionVertex consumerVertex) {
+		CompletableFuture.supplyAsync(
+			() -> {
+				try {
+					final ExecutionGraph executionGraph = consumerVertex.getExecutionGraph();
+					consumerVertex.scheduleForExecution(
+							executionGraph.getSlotProvider(),
+							executionGraph.isQueuedSchedulingAllowed(),
+							LocationPreferenceConstraint.ANY, // there must be at least one known location
+							Collections.emptySet());
+				} catch (Throwable t) {
+					consumerVertex.fail(new IllegalStateException("Could not schedule consumer " +
+							"vertex " + consumerVertex, t));
+				}
+
+				return null;
+			},
+			executor);
+	}
+
 	void scheduleOrUpdateConsumers(List<List<ExecutionEdge>> allConsumers) {
 		final int numConsumers = allConsumers.size();
 
@@ -729,22 +776,16 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 				// TODO The current approach may send many update messages even though the consuming
 				// task has already been deployed with all necessary information. We have to check
 				// whether this is a problem and fix it, if it is.
-				CompletableFuture.supplyAsync(
-					() -> {
-						try {
-							final ExecutionGraph executionGraph = consumerVertex.getExecutionGraph();
-							consumerVertex.scheduleForExecution(
-								executionGraph.getSlotProvider(),
-								executionGraph.isQueuedSchedulingAllowed(),
-								LocationPreferenceConstraint.ANY); // there must be at least one known location
-						} catch (Throwable t) {
-							consumerVertex.fail(new IllegalStateException("Could not schedule consumer " +
-									"vertex " + consumerVertex, t));
-						}
 
-						return null;
-					},
-					executor);
+				// Schedule the consumer vertex if its inputs constraint is satisfied, otherwise skip the scheduling.
+				// A shortcut of input constraint check is added for InputDependencyConstraint.ANY since
+				// at least one of the consumer vertex's inputs is consumable here. This is to avoid the
+				// O(N) complexity introduced by input constraint check for InputDependencyConstraint.ANY,
+				// as we do not want the default scheduling performance to be affected.
+				if (consumerVertex.getInputDependencyConstraint() == InputDependencyConstraint.ANY ||
+						consumerVertex.checkInputDependencyConstraints()) {
+					scheduleConsumer(consumerVertex);
+				}
 
 				// double check to resolve race conditions
 				if (consumerVertex.getExecutionState() == RUNNING) {
@@ -766,11 +807,10 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 					final TaskManagerLocation partitionTaskManagerLocation = partition.getProducer()
 							.getCurrentAssignedResource().getTaskManagerLocation();
 					final ResourceID partitionTaskManager = partitionTaskManagerLocation.getResourceID();
-					
+
 					final ResourceID consumerTaskManager = consumerSlot.getTaskManagerLocation().getResourceID();
 
 					final ResultPartitionID partitionId = new ResultPartitionID(partition.getPartitionId(), attemptId);
-					
 
 					final ResultPartitionLocation partitionLocation;
 
@@ -979,7 +1019,7 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 	void cancelingComplete() {
 		cancelingComplete(null, null);
 	}
-	
+
 	void cancelingComplete(Map<String, Accumulator<?, ?>> userAccumulators, IOMetrics metrics) {
 
 		// the taskmanagers can themselves cancel tasks without an external trigger, if they find that the
@@ -1141,7 +1181,7 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 			else if (currentState == CANCELING || currentState == FAILED) {
 				if (LOG.isDebugEnabled()) {
 					// this log statement is guarded because the 'getVertexWithAttempt()' method
-					// performs string concatenations 
+					// performs string concatenations
 					LOG.debug("Concurrent canceling/failing of {} while deployment was in progress.", getVertexWithAttempt());
 				}
 				sendCancelRpcCall();
@@ -1168,7 +1208,7 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 	/**
 	 * This method sends a CancelTask message to the instance of the assigned slot.
 	 *
-	 * The sending is tried up to NUM_CANCEL_CALL_TRIES times.
+	 * <p>The sending is tried up to NUM_CANCEL_CALL_TRIES times.
 	 */
 	private void sendCancelRpcCall() {
 		final LogicalSlot slot = assignedResource;
@@ -1231,9 +1271,9 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 
 	/**
 	 * Releases the assigned resource and completes the release future
-	 * once the assigned resource has been successfully released
+	 * once the assigned resource has been successfully released.
 	 *
-	 * @param cause for the resource release, null if none 	 
+	 * @param cause for the resource release, null if none
 	 */
 	private void releaseAssignedResource(@Nullable Throwable cause) {
 		final LogicalSlot slot = assignedResource;
@@ -1350,7 +1390,7 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 	// ------------------------------------------------------------------------
 	//  Accumulators
 	// ------------------------------------------------------------------------
-	
+
 	/**
 	 * Update accumulators (discarded when the Execution has already been terminated).
 	 * @param userAccumulators the user accumulators
@@ -1362,7 +1402,7 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 			}
 		}
 	}
-	
+
 	public Map<String, Accumulator<?, ?>> getUserAccumulators() {
 		return userAccumulators;
 	}
@@ -1382,7 +1422,7 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 	public int getParallelSubtaskIndex() {
 		return getVertex().getParallelSubtaskIndex();
 	}
-		
+
 	@Override
 	public IOMetrics getIOMetrics() {
 		return ioMetrics;
@@ -1402,7 +1442,7 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 	// ------------------------------------------------------------------------
 	//  Standard utilities
 	// ------------------------------------------------------------------------
-	
+
 	@Override
 	public String toString() {
 		final LogicalSlot slot = assignedResource;

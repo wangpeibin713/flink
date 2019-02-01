@@ -22,15 +22,20 @@ import org.apache.flink.runtime.concurrent.FutureUtils;
 import org.apache.flink.runtime.rpc.MainThreadValidatorUtil;
 import org.apache.flink.runtime.rpc.RpcEndpoint;
 import org.apache.flink.runtime.rpc.RpcGateway;
+import org.apache.flink.runtime.rpc.akka.exceptions.AkkaHandshakeException;
 import org.apache.flink.runtime.rpc.akka.exceptions.AkkaRpcException;
 import org.apache.flink.runtime.rpc.akka.exceptions.AkkaUnknownMessageException;
 import org.apache.flink.runtime.rpc.akka.messages.Processing;
 import org.apache.flink.runtime.rpc.exceptions.RpcConnectionException;
 import org.apache.flink.runtime.rpc.messages.CallAsync;
+import org.apache.flink.runtime.rpc.messages.HandshakeSuccessMessage;
 import org.apache.flink.runtime.rpc.messages.LocalRpcInvocation;
+import org.apache.flink.runtime.rpc.messages.RemoteHandshakeMessage;
 import org.apache.flink.runtime.rpc.messages.RpcInvocation;
 import org.apache.flink.runtime.rpc.messages.RunAsync;
+import org.apache.flink.types.Either;
 import org.apache.flink.util.ExceptionUtils;
+import org.apache.flink.util.SerializedValue;
 
 import akka.actor.ActorRef;
 import akka.actor.Status;
@@ -49,6 +54,7 @@ import java.util.concurrent.TimeUnit;
 import scala.concurrent.duration.FiniteDuration;
 import scala.concurrent.impl.Promise;
 
+import static org.apache.flink.util.Preconditions.checkArgument;
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
@@ -80,10 +86,25 @@ class AkkaRpcActor<T extends RpcEndpoint & RpcGateway> extends UntypedActor {
 
 	private final CompletableFuture<Boolean> terminationFuture;
 
-	AkkaRpcActor(final T rpcEndpoint, final CompletableFuture<Boolean> terminationFuture) {
+	private final int version;
+
+	private final long maximumFramesize;
+
+	private State state;
+
+	AkkaRpcActor(
+			final T rpcEndpoint,
+			final CompletableFuture<Boolean> terminationFuture,
+			final int version,
+			final long maximumFramesize) {
+
+		checkArgument(maximumFramesize > 0, "Maximum framesize must be positive.");
 		this.rpcEndpoint = checkNotNull(rpcEndpoint, "rpc endpoint");
 		this.mainThreadValidator = new MainThreadValidatorUtil(rpcEndpoint);
 		this.terminationFuture = checkNotNull(terminationFuture);
+		this.version = version;
+		this.maximumFramesize = maximumFramesize;
+		this.state = State.STOPPED;
 	}
 
 	@Override
@@ -120,21 +141,20 @@ class AkkaRpcActor<T extends RpcEndpoint & RpcGateway> extends UntypedActor {
 
 	@Override
 	public void onReceive(final Object message) {
-		if (message.equals(Processing.START)) {
-			getContext().become(
-				(Object msg) -> {
-					if (msg.equals(Processing.STOP)) {
-						getContext().unbecome();
-					} else {
-						mainThreadValidator.enterMainThread();
+		if (message instanceof RemoteHandshakeMessage) {
+			handleHandshakeMessage((RemoteHandshakeMessage) message);
+		} else if (message.equals(Processing.START)) {
+			state = State.STARTED;
+		} else if (message.equals(Processing.STOP)) {
+			state = State.STOPPED;
+		} else if (state == State.STARTED) {
+			mainThreadValidator.enterMainThread();
 
-						try {
-							handleMessage(msg);
-						} finally {
-							mainThreadValidator.exitMainThread();
-						}
-					}
-				});
+			try {
+				handleRpcMessage(message);
+			} finally {
+				mainThreadValidator.exitMainThread();
+			}
 		} else {
 			log.info("The rpc endpoint {} has not been started yet. Discarding message {} until processing is started.",
 				rpcEndpoint.getClass().getName(),
@@ -145,7 +165,7 @@ class AkkaRpcActor<T extends RpcEndpoint & RpcGateway> extends UntypedActor {
 		}
 	}
 
-	protected void handleMessage(Object message) {
+	protected void handleRpcMessage(Object message) {
 		if (message instanceof RunAsync) {
 			handleRunAsync((RunAsync) message);
 		} else if (message instanceof CallAsync) {
@@ -161,6 +181,35 @@ class AkkaRpcActor<T extends RpcEndpoint & RpcGateway> extends UntypedActor {
 			sendErrorIfSender(new AkkaUnknownMessageException("Received unknown message " + message +
 				" of type " + message.getClass().getSimpleName() + '.'));
 		}
+	}
+
+	private void handleHandshakeMessage(RemoteHandshakeMessage handshakeMessage) {
+		if (!isCompatibleVersion(handshakeMessage.getVersion())) {
+			sendErrorIfSender(new AkkaHandshakeException(
+				String.format(
+					"Version mismatch between source (%s) and target (%s) rpc component. Please verify that all components have the same version.",
+					handshakeMessage.getVersion(),
+					getVersion())));
+		} else if (!isGatewaySupported(handshakeMessage.getRpcGateway())) {
+			sendErrorIfSender(new AkkaHandshakeException(
+				String.format(
+					"The rpc endpoint does not support the gateway %s.",
+					handshakeMessage.getRpcGateway().getSimpleName())));
+		} else {
+			getSender().tell(new Status.Success(HandshakeSuccessMessage.INSTANCE), getSelf());
+		}
+	}
+
+	private boolean isGatewaySupported(Class<?> rpcGateway) {
+		return rpcGateway.isAssignableFrom(rpcEndpoint.getClass());
+	}
+
+	private boolean isCompatibleVersion(int sourceVersion) {
+		return sourceVersion == getVersion();
+	}
+
+	private int getVersion() {
+		return version;
 	}
 
 	/**
@@ -217,6 +266,9 @@ class AkkaRpcActor<T extends RpcEndpoint & RpcGateway> extends UntypedActor {
 						return;
 					}
 
+					final boolean isRemoteSender = isRemoteSender();
+					final String methodName = rpcMethod.getName();
+
 					if (result instanceof CompletableFuture) {
 						final CompletableFuture<?> future = (CompletableFuture<?>) result;
 						Promise.DefaultPromise<Object> promise = new Promise.DefaultPromise<>();
@@ -226,14 +278,33 @@ class AkkaRpcActor<T extends RpcEndpoint & RpcGateway> extends UntypedActor {
 								if (throwable != null) {
 									promise.failure(throwable);
 								} else {
-									promise.success(value);
+									if (isRemoteSender) {
+										Either<SerializedValue<?>, AkkaRpcException> serializedResult = serializeRemoteResultAndVerifySize(value, methodName);
+
+										if (serializedResult.isLeft()) {
+											promise.success(serializedResult.left());
+										} else {
+											promise.failure(serializedResult.right());
+										}
+									} else {
+										promise.success(value);
+									}
 								}
 							});
 
 						Patterns.pipe(promise.future(), getContext().dispatcher()).to(getSender());
 					} else {
-						// tell the sender the result of the computation
-						getSender().tell(new Status.Success(result), getSelf());
+						if (isRemoteSender) {
+							Either<SerializedValue<?>, AkkaRpcException> serializedResult = serializeRemoteResultAndVerifySize(result, methodName);
+
+							if (serializedResult.isLeft()) {
+								getSender().tell(new Status.Success(serializedResult.left()), getSelf());
+							} else {
+								getSender().tell(new Status.Failure(serializedResult.right()), getSelf());
+							}
+						} else {
+							getSender().tell(new Status.Success(result), getSelf());
+						}
 					}
 				}
 			} catch (Throwable e) {
@@ -241,6 +312,28 @@ class AkkaRpcActor<T extends RpcEndpoint & RpcGateway> extends UntypedActor {
 				// tell the sender about the failure
 				getSender().tell(new Status.Failure(e), getSelf());
 			}
+		}
+	}
+
+	private boolean isRemoteSender() {
+		return !getSender().path().address().hasLocalScope();
+	}
+
+	private Either<SerializedValue<?>, AkkaRpcException> serializeRemoteResultAndVerifySize(Object result, String methodName) {
+		try {
+			SerializedValue<?> serializedResult = new SerializedValue<>(result);
+
+			long resultSize = serializedResult.getByteArray().length;
+			if (resultSize > maximumFramesize) {
+				return Either.Right(new AkkaRpcException(
+					"The method " + methodName + "'s result size " + resultSize
+						+ " exceeds the maximum size " + maximumFramesize + " ."));
+			} else {
+				return Either.Left(serializedResult);
+			}
+		} catch (IOException e) {
+			return Either.Right(new AkkaRpcException(
+				"Failed to serialize the result for RPC call : " + methodName + '.', e));
 		}
 	}
 
@@ -343,5 +436,10 @@ class AkkaRpcActor<T extends RpcEndpoint & RpcGateway> extends UntypedActor {
 	 */
 	protected Object envelopeSelfMessage(Object message) {
 		return message;
+	}
+
+	enum State {
+		STARTED,
+		STOPPED
 	}
 }

@@ -34,7 +34,7 @@ public class SemanticsCheckMapper extends RichFlatMapFunction<Event, String> {
 	private static final long serialVersionUID = -744070793650644485L;
 
 	/** This value state tracks the current sequence number per key. */
-	private volatile ValueState<Long> sequenceValue;
+	private transient ValueState<Long> sequenceValue;
 
 	/** This defines how semantics are checked for each update. */
 	private final ValidatorFunction validator;
@@ -53,9 +53,8 @@ public class SemanticsCheckMapper extends RichFlatMapFunction<Event, String> {
 
 		long nextValue = event.getSequenceNumber();
 
-		if (validator.check(currentValue, nextValue)) {
-			sequenceValue.update(nextValue);
-		} else {
+		sequenceValue.update(nextValue);
+		if (!validator.check(currentValue, nextValue)) {
 			out.collect("Alert: " + currentValue + " -> " + nextValue + " (" + event.getKey() + ")");
 		}
 	}
